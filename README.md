@@ -1,11 +1,11 @@
 # cds-relay
 
-A Rust TCP/UDP relay for platforms. The platform initiates a mutually authenticated QUIC connection to the relay. Each TCP connection uses an independent QUIC stream; UDP packets use unreliable QUIC DATAGRAMs. User traffic continues to pass through the platform.
+A Rust TCP/UDP relay for platforms. The relay uses independent mTLS/TCP connections for TCP targets and DTLS/UDP associations for UDP targets. The platform initiates every association. User traffic continues to pass through the platform.
 
 ```mermaid
 flowchart LR
     user["User client"] <-->|WebTransport| platform["Platform<br/>cds-relay-client"]
-    platform <-->|"QUIC + mutual TLS<br/>Streams: TCP / control<br/>Datagrams: UDP"| relay["cds-relay-server"]
+    platform <-->|"mTLS / TCP<br/>DTLS / UDP"| relay["cds-relay-server"]
     relay <-->|TCP / UDP| service["Service ClusterIP"]
     service <--> challenge["Challenge Pod"]
     subgraph cluster["Kubernetes cluster"]
@@ -15,22 +15,22 @@ flowchart LR
     end
 ```
 
-This repository implements the relay client, server, credentials, and wire protocols. The platform owns the public WebTransport endpoint and target selection. A native QUIC backend is not a WebTransport server. The platform can run in Kubernetes, in Docker, or as a development binary, provided it can reach the relay's UDP listener. The relay does not initiate a connection to the platform.
+This repository implements the relay client, server, credentials, and wire protocols. The platform owns the public WebTransport endpoint and target selection. The backend transport is separate from the public WebTransport server. The platform can run in Kubernetes, in Docker, or as a development binary, provided it can reach both the relay's TCP and UDP listeners. The relay does not initiate a connection to the platform.
 
-QUIC is the only platform-to-relay transport. TCP and UDP describe the target-side protocols: the relay opens native TCP or UDP sockets to the selected Service. The server listens on UDP and requires a mutual TLS identity.
+Native mode listens on TCP and UDP at the same numerical port. TCP streams and UDP packets have independent transport behavior; UDP application data never travels through TCP. Mutual TLS authenticates the installation and derives per-association DTLS keys. TLS/TCP and DTLS/UDP are the only supported platform-to-relay transports.
 
 ## Workspace
 
 | Crate | Purpose |
 | --- | --- |
-| `cds-relay-protocol` | Versioned QUIC stream opening requests and status responses |
-| `cds-relay-quic` | Mutual TLS configuration, credential files, stream adapter, and bounded datagram routing |
-| `cds-relay-client` | Multiplexed QUIC client with TCP tunnels and UDP associations |
+| `cds-relay-protocol` | Versioned target opening requests and status responses |
+| `cds-relay-native` | Native TLS/TCP client, DTLS/UDP sessions, and bounded datagram routing |
+| `cds-relay-client` | `RelayClient` / `NativeClient` SDK and connectivity example |
 | `cds-relay-server` | Server libraries, identity generation, and standalone binary |
 
 The workspace requires Rust 1.85 or newer. It does not depend on Kubernetes or a platform database.
 
-## Run QUIC locally
+## Run locally
 
 Generate separate relay and platform credentials into a new directory:
 
@@ -55,8 +55,8 @@ python3 examples/echo.py
 Probe TCP and UDP from another terminal:
 
 ```sh
-cargo run -p cds-relay-client --example quic_probe -- relay-identity/platform.json tcp 127.0.0.1:9000 hello
-cargo run -p cds-relay-client --example quic_probe -- relay-identity/platform.json udp 127.0.0.1:9000 hello
+cargo run -p cds-relay-client --example native_probe -- relay-identity/platform.json tcp 127.0.0.1:9000 hello
+cargo run -p cds-relay-client --example native_probe -- relay-identity/platform.json udp 127.0.0.1:9000 hello
 ```
 
 The probes print the first response chunk. They are connectivity examples, not complete port-forwarding CLIs. UDP probes can time out if a datagram is lost.
@@ -64,11 +64,11 @@ The probes print the first response chunk. They are connectivity examples, not c
 ## Platform integration
 
 ```rust,no_run
-use cds_relay_client::{ClientCredentials, QuicClient};
+use cds_relay_client::{ClientCredentials, RelayClient};
 
 async fn example() -> Result<(), Box<dyn std::error::Error>> {
     let credentials = ClientCredentials::read("/run/secrets/relay/platform.json")?;
-    let relay = QuicClient::connect(&credentials).await?;
+    let relay = RelayClient::connect(&credentials).await?;
 
     // Reuse or clone this client for multiple TCP connections and UDP flows.
     let tcp = relay.open_tcp("10.42.0.12:8080".parse()?).await?;
@@ -76,36 +76,52 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
 
     let udp = relay.open_udp("10.42.0.12:5353".parse()?).await?;
     let (mut receiver, sender) = udp.split();
-    let limit = sender.max_payload().ok_or("QUIC DATAGRAM unavailable")?;
+    let limit = sender.max_payload().ok_or("UDP unavailable")?;
     assert!(b"request".len() <= limit);
-    sender.send(b"request")?;
+    sender.send(b"request").await?;
     let response = receiver.recv().await?;
     Ok(())
 }
 ```
 
-`QuicClient` clones share one QUIC connection; tunnels retain its lifetime. Dropping either UDP half closes that association. Dropping the last client/tunnel closes the connection; `QuicClient::close()` immediately terminates every tunnel held by its clones. Failed connections are not automatically reconnected or replayed.
+`RelayClient` is an alias for `NativeClient`. Clones reuse local TLS configuration;
+each target gets an independent connection. Construction validates credentials;
+network authentication occurs during `open_tcp` / `open_udp`. The open timeout
+covers connection setup, mutual TLS, target opening, and (for UDP) DTLS setup.
+Dropping a client does not terminate existing tunnels. Dropping either UDP half
+closes that association. Cancelling a receive does not close it. UDP `send` is
+asynchronous and confirms a local write, not remote delivery.
 
-`connect_with_timeout` bounds the TLS handshake. Each subsequent open has the same total timeout covering stream capacity, request transmission, and the target-open response. Cancelling an open drops its stream. UDP receive is cancellation safe. `send` is synchronous and only enqueues a packet locally; it does not confirm delivery.
-
-QUIC path MTU and the peer's DATAGRAM limit determine the UDP payload limit. Query `max_payload()` on a UDP tunnel/sender or `max_udp_payload()` on the client before sending. The limit can change. Oversized platform packets return an error; oversized target packets are dropped whole. There is no application fragmentation, reliable-stream fallback, or UDP retransmission. Each direction of the public WebTransport connection has its own size limit; the platform must account for both.
-
-See the [QUIC guide](docs/quic.md) for credentials and limits, and the [wire protocols](docs/protocol.md) for framing and lifecycle.
+The native UDP payload limit is 1,152 bytes. Query `max_payload()` before sending.
+Oversized platform packets return an error; oversized target packets are dropped
+whole. No application fragmentation, retransmission, or TCP fallback is used.
+The public WebTransport hop has its own size limits. See the
+[native transport guide](docs/native.md) for framing, authentication, key lifetime,
+and NAT restrictions.
 
 ## Server options
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--listen` | `127.0.0.1:9527` | QUIC UDP listening address |
+| `--listen` | `127.0.0.1:9527` | TCP and UDP address |
 | `--identity` | Required | Relay identity JSON; required when serving |
-| `--max-connections` | `256` | Independently caps pending/established QUIC connections and global target sessions |
-| `--handshake-timeout` | `5` | Seconds for TLS authentication, reading each opening request, and writing its response, measured separately |
+| `--max-connections` | `256` | Caps sessions including pending TLS/DTLS setup |
+| `--handshake-timeout` | `5` | Combined TLS/open-header deadline and separate UDP setup deadline, in seconds |
 | `--connect-timeout` | `5` | Target socket setup timeout in seconds |
 | `--udp-idle-timeout` | `60` | UDP association idle timeout in seconds |
+| `--tcp-rate-limit-mbps` | `0` | Relay-wide TCP payload ceiling per direction; 0 disables pacing |
+| `--udp-max-queue-delay-ms` | `0` | Expiry in relay receive-dispatch queues; 0 disables expiry |
 
-QUIC allows at most 256 simultaneous target streams per connection, subject to the global target-session cap. Each connection has one datagram dispatcher and each UDP flow has a queue of at most 32 packets. Full queues discard incoming packets without blocking other flows. Quinn's receive/send datagram buffers are each capped at 256 KiB per connection; outgoing congestion may discard queued datagrams. These bounds do not provide fairness between hostile authenticated clients.
+See [relay-only traffic control](docs/traffic-control.md) for aggregate TCP
+pacing and the limits of receive-queue expiry. Both are optional and disabled
+by default.
 
-Established TCP tunnels have no application idle timeout. QUIC uses a 60-second transport idle timeout and a 15-second keepalive interval. Ctrl-C and SIGTERM close connections, cancel sessions, and wait for target-task cleanup. Set `RUST_LOG=debug` to inspect session failures.
+Native UDP dispatch has 128 packets per association and a shared 1 MiB queued
+ciphertext budget across the server. A full queue or exhausted byte budget drops
+packets without blocking other associations. Unknown associations receive no
+response and allocate no session state. Established TCP tunnels have no
+application idle timeout; inactive UDP targets expire after 60 seconds by default.
+Ctrl-C and SIGTERM cancel sessions and wait for target-task cleanup.
 
 ## Container images
 
@@ -134,11 +150,11 @@ To build a local image:
 docker build -t ghcr.io/cdsctf/relay:dev .
 ```
 
-The image runs as UID 65532. When mounting QUIC identities, grant that user read access to its server file without exposing the platform file. The container does not generate or embed credentials during its build.
+The image runs as UID 65532. When mounting identities, grant that user read access to its server file without exposing the platform file. The container does not generate or embed credentials during its build.
 
 ## Kubernetes
 
-The [deployment example](deploy/kubernetes.yaml) runs the QUIC relay on UDP port 9527, mounts `server.json` from the `cds-relay-identity` Secret, and provides an internal ClusterIP UDP Service. It mounts no ServiceAccount token and does not call the Kubernetes API. The relay can connect to target Services using their ClusterIP and Service port, subject to cluster networking and NetworkPolicy.
+The [deployment example](deploy/kubernetes.yaml) runs the native relay on TCP and UDP port 9527, mounts `server.json` from the `cds-relay-identity` Secret, and provides an internal ClusterIP Service with both protocols. It mounts no ServiceAccount token and does not call the Kubernetes API. The relay can connect to target Services using their ClusterIP and Service port, subject to cluster networking and NetworkPolicy.
 
 Create the `cdsctf` namespace beforehand. Generate an identity pair using an endpoint reachable from the platform, then create the server Secret and apply the manifest:
 
@@ -148,9 +164,9 @@ kubectl apply -n cdsctf -f deploy/kubernetes.yaml
 kubectl rollout status -n cdsctf deployment/cds-relay
 ```
 
-Mount only `platform.json` into the platform. Its endpoint must match a relay UDP address that the platform can actually reach. An internal ClusterIP is appropriate when the platform has a route to the Service network. Access from an external Docker container or development binary requires a reachable UDP endpoint; exposure and routing remain separate deployment decisions. TCP port-forward cannot carry QUIC.
+Mount only `platform.json` into the platform. Its endpoint must match a relay TCP/UDP address that the platform can actually reach. An internal ClusterIP is appropriate when the platform has a route to the Service network. Access from an external Docker container or development binary requires reachable TCP and UDP endpoints at the same numerical port; exposure and routing remain separate deployment decisions. TCP port-forward alone cannot carry the native UDP channel.
 
-The Secret files are group-readable by the Pod's filesystem group (65532). The manifest defines no TCP listener, TCP health probes, NodePort, or hostPort. No application readiness/liveness probes are configured; rollout status alone does not validate an authenticated target connection. Use an authenticated probe with a known target for connectivity checks. Use a release tag or image digest for reproducible deployments.
+The Secret files are group-readable by the Pod's filesystem group (65532). The manifest defines no NodePort or hostPort. It uses a TCP readiness probe, one replica, and `Recreate` updates. TCP and UDP for an association must reach the same relay process; ordinary multi-replica load balancing is unsupported without cross-protocol affinity. Replacement interrupts tunnels, and clients must reopen them after Service endpoint convergence. Readiness alone does not validate an authenticated target connection. Use an authenticated probe with a known target for connectivity checks and a release tag or image digest for reproducible deployments.
 
 ## Scope and verification
 
@@ -164,6 +180,14 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 ```
 
-Tests cover QUIC-only startup, protocol version rejection, real local QUIC connections, mutual TLS rejection, TCP half-close, UDP isolation and empty packets, size limits, queue pressure, idle expiry, capacity, IPv6, and shutdown. Production throughput, loss under real network conditions, container execution, and QUIC deployment still require validation in the target environment.
+Tests cover native TLS/DTLS authentication and shutdown, TCP half-close, UDP empty packets and isolation, forged packets, stalled setup, cancellation, payload limits, idle expiry, IPv6, and capacity. Deployment capacity and WAN quality require measurement on the intended path.
 
-The session isolation design drew on [krelay](https://github.com/knight42/krelay/tree/017a53e63d11b9b53328f626ec38fd1206b31afc) and [kftray](https://github.com/hcavarsan/kftray/tree/b870cb36a314b9d58a8425c8672dc89f0ee3e80c), without copying their source code. The native QUIC transport uses [Quinn](https://github.com/quinn-rs/quinn) and [rustls](https://github.com/rustls/rustls).
+The [experiment conclusions](docs/experiments.md) retain the findings behind
+the transport choice, including failed latency targets and deployment recovery
+limitations. Historical benchmark tools, prototypes, raw data, and QUIC support
+have been removed.
+
+The session isolation design drew on
+[krelay](https://github.com/knight42/krelay/tree/017a53e63d11b9b53328f626ec38fd1206b31afc)
+and [kftray](https://github.com/hcavarsan/kftray/tree/b870cb36a314b9d58a8425c8672dc89f0ee3e80c),
+without copying their source code. TLS uses rustls; DTLS uses webrtc-dtls.

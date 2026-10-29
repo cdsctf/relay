@@ -1,5 +1,4 @@
-use crate::{ALPN, MAX_STREAMS, invalid, transport};
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use crate::ALPN;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -122,7 +121,7 @@ fn roots(pem: &str) -> io::Result<rustls::RootCertStore> {
     Ok(roots)
 }
 
-pub fn client_config(credentials: &ClientCredentials) -> io::Result<quinn::ClientConfig> {
+pub fn client_tls_config(credentials: &ClientCredentials) -> io::Result<rustls::ClientConfig> {
     credentials.validate()?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
@@ -133,13 +132,11 @@ pub fn client_config(credentials: &ClientCredentials) -> io::Result<quinn::Clien
         .map_err(invalid)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     tls.enable_early_data = false;
-    let mut config =
-        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).map_err(invalid)?));
-    config.transport_config(Arc::new(transport(0)));
-    Ok(config)
+    tls.resumption = rustls::client::Resumption::disabled();
+    Ok(tls)
 }
 
-pub fn server_config(identity: &ServerIdentity) -> io::Result<quinn::ServerConfig> {
+pub fn server_tls_config(identity: &ServerIdentity) -> io::Result<rustls::ServerConfig> {
     identity.validate()?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
@@ -156,10 +153,9 @@ pub fn server_config(identity: &ServerIdentity) -> io::Result<quinn::ServerConfi
         .map_err(invalid)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     tls.max_early_data_size = 0;
-    let mut config = quinn::ServerConfig::with_crypto(Arc::new(
-        QuicServerConfig::try_from(tls).map_err(invalid)?,
-    ));
-    config.transport_config(Arc::new(transport(MAX_STREAMS)));
-    config.max_incoming(256);
-    Ok(config)
+    Ok(tls)
+}
+
+fn invalid(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
 }

@@ -1,6 +1,6 @@
-//! Versioned, IP-addressed opening requests for the QUIC relay.
+//! Versioned, IP-addressed opening requests for authenticated relay transports.
 //!
-//! One QUIC stream carries one TCP connection or controls one UDP association.
+//! One reliable stream carries one TCP connection or controls one UDP association.
 //! Multi-byte integers are big endian. See `docs/protocol.md` for the wire format.
 
 use std::{
@@ -11,8 +11,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAGIC: [u8; 4] = *b"CDSR";
 pub const VERSION: u8 = 2;
-/// A conservative common limit for IPv4 and IPv6 UDP payloads.
-pub const MAX_DATAGRAM_SIZE: usize = 65_507;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

@@ -7,6 +7,8 @@ metadata:
     app.kubernetes.io/instance: development
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: cds-relay
@@ -36,9 +38,16 @@ spec:
             - --identity
             - /run/secrets/relay/server.json
           ports:
-            - name: quic
+            - name: relay-tcp
+              containerPort: 9527
+              protocol: TCP
+            - name: relay-udp
               containerPort: 9527
               protocol: UDP
+          readinessProbe:
+            tcpSocket:
+              port: relay-tcp
+            periodSeconds: 2
           volumeMounts:
             - name: identity
               mountPath: /run/secrets/relay
@@ -77,7 +86,11 @@ spec:
     app.kubernetes.io/name: cds-relay
     app.kubernetes.io/instance: development
   ports:
-    - name: quic
+    - name: relay-tcp
       port: 9527
-      targetPort: quic
+      targetPort: relay-tcp
+      protocol: TCP
+    - name: relay-udp
+      port: 9527
+      targetPort: relay-udp
       protocol: UDP

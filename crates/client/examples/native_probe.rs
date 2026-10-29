@@ -1,5 +1,5 @@
-//! Run with: quic_probe <platform.json> <tcp|udp> <target IP:port> <payload>.
-use cds_relay_client::{ClientCredentials, QuicClient};
+//! Run with: native_probe <platform.json> <tcp|udp> <target IP:port> <payload>.
+use cds_relay_client::{ClientCredentials, RelayClient};
 use std::{error::Error, io, net::SocketAddr, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -8,13 +8,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.len() != 4 {
         return Err(
-            "usage: quic_probe <platform.json> <tcp|udp> <target IP:port> <payload>".into(),
+            "usage: native_probe <platform.json> <tcp|udp> <target IP:port> <payload>".into(),
         );
     }
     let credentials = ClientCredentials::read(&args[0])?;
     let target: SocketAddr = args[2].parse()?;
     let response = tokio::time::timeout(Duration::from_secs(15), async {
-        let client = QuicClient::connect(&credentials).await?;
+        let client = RelayClient::connect(&credentials).await?;
         match args[1].as_str() {
             "tcp" => {
                 let mut stream = client.open_tcp(target).await?;
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             "udp" => {
                 let mut tunnel = client.open_udp(target).await?;
-                tunnel.send(args[3].as_bytes())?;
+                tunnel.send(args[3].as_bytes()).await?;
                 let packet = tunnel.recv().await?.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::UnexpectedEof,

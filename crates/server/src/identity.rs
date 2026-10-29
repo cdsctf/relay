@@ -1,6 +1,6 @@
 //! Generate a separate relay and platform identity for one installation.
 
-use cds_relay_quic::{ClientCredentials, ServerIdentity, invalid};
+use cds_relay_native::{ClientCredentials, ServerIdentity, invalid};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,

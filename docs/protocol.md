@@ -1,6 +1,10 @@
-# cds-relay QUIC wire protocol v2
+# cds-relay wire protocol v2
 
-All multi-byte integers use big-endian encoding. The only backend transport is QUIC with ALPN `cds-relay/2`. Each client-initiated bidirectional stream begins with a version 2 opening request selecting one numeric target and target-side transport protocol. QUIC authenticates the platform using mutual TLS; opening requests carry no individual user authentication.
+All multi-byte integers use big-endian encoding. Each target uses a separate
+mutually authenticated TLS 1.3 connection with ALPN `cds-relay-native/1`.
+Opening requests select one numeric target and target-side transport protocol;
+they carry no individual user authentication. Credential JSON and opening
+headers retain version 2. There is no transport negotiation or fallback.
 
 ## Opening a connection
 
@@ -35,27 +39,34 @@ For TCP, success means the target TCP connection has been established. For UDP, 
 
 All bytes after a successful response are raw TCP data. FIN propagates to the opposite socket's write direction while the other direction continues to drain. Errors, a platform disconnect, or server shutdown terminate the session.
 
-## UDP data
+## UDP setup and data
 
-Each UDP association has a client-initiated bidirectional control stream. After its opening request and successful response, neither endpoint sends application bytes on that stream. FIN, RESET_STREAM, STOP_SENDING, unexpected control data, idle expiry, connection loss, or shutdown ends the association. There is no half-close or datagram-draining guarantee for UDP.
+After the success status, the relay sends a random 16-byte association ID on
+the TLS control connection. Both peers derive a 32-byte PSK using the TLS
+exporter label `EXPORTER-cds-relay-native-dtls-v1` and that ID as context.
+They establish DTLS 1.2 with `TLS_PSK_WITH_AES_128_GCM_SHA256`, requiring
+Extended Master Secret. The relay then sends one zero ready byte on TLS.
+`open_udp` returns only after this confirmation. The initial success status
+alone does not establish DTLS readiness or target reachability.
 
-Each QUIC DATAGRAM payload has this layout:
+Each outer UDP datagram contains the 16-byte ID followed by a DTLS datagram.
+Encrypted application records start with a one-byte type: `0` carries one
+complete target packet (0–1,152 bytes), and `1` is a keepalive with an empty
+body. The routing ID is not a secret or bearer credential. DTLS authenticates
+payloads and protects against replay. UDP application data never enters TCP.
 
-| Field | Bytes | Meaning |
-| --- | --- | --- |
-| flow ID | 8 | Full QUIC stream ID of the UDP association, encoded as fixed-width `u64`, not a QUIC variable-length integer |
-| payload | Remaining | One complete UDP datagram, possibly empty |
+The TCP control connection stays open for the association lifetime. EOF,
+errors, unexpected control data, target idle expiry, setup failure, or shutdown
+removes the mapping and connected target socket. Dropping either client UDP
+half also closes the association. There is no UDP half-close, retransmission,
+application fragmentation, or reliable fallback. Oversized replies are dropped
+whole. Keepalives do not refresh target application activity.
 
-There is no length prefix, target address, sequence number, acknowledgement, or retransmission. The QUIC frame defines the packet boundary. A DATAGRAM shorter than eight bytes, larger than 65,515 bytes, or addressed to an unregistered flow is discarded. IDs are scoped to the QUIC connection and never reused within that connection. TCP stream IDs are not registered as UDP flows.
+Both protocols must reach the same relay process. The dispatcher requires the
+UDP source IP to match the TLS peer and pins the first UDP source port; roaming,
+rebinding, and split egress IPs are unsupported. Associations close after 2^24
+outbound application records and must be reopened for fresh keys.
 
-The client registers its flow before sending OPEN; the server registers before sending success. The client must wait for success before sending datagrams. Stream and DATAGRAM ordering are independent, so packets sent early can be dropped. Full receive queues drop new packets without delaying other flows. Closing the control stream removes the flow mapping; late packets are discarded.
-
-The outbound UDP payload must fit `min(65507, max_datagram_size - 8)` for the current QUIC connection and direction. Oversized platform packets produce a local error. Oversized target packets are dropped whole; no truncation, reliable-stream fallback, or application fragmentation is allowed. A valid eight-byte DATAGRAM carries an empty UDP packet.
-
-Each association uses one connected target socket, preserving a stable source port and filtering unexpected target sources. Successful target sends and successfully queued target replies update the idle deadline. Dropped malformed/oversized/unknown packets do not. Closing the whole connection cancels and joins its target tasks; server shutdown performs the same cleanup for all connections.
-
-See the [QUIC guide](quic.md) for authentication, buffer limits, and credential lifecycle.
-
-## Versioning
-
-Only opening version 2 is supported. Other versions are rejected with `UnsupportedVersion`; no transport fallback or downgrade is available. QUIC DATAGRAM support is required even for a connection initially used only for TCP. Any incompatible change requires a new protocol version. Release the image, client crate, and protocol crates together.
+See the [native transport guide](native.md) for resource bounds, MTU, NAT,
+authentication, and key-lifetime details. Incompatible changes require a new
+protocol version; release the image and client/protocol crates together.
