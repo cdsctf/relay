@@ -1,6 +1,6 @@
-//! Versioned, IP-addressed relay handshake and bounded UDP framing.
+//! Versioned, IP-addressed opening requests for the QUIC relay.
 //!
-//! One transport stream carries one TCP connection or one UDP association.
+//! One QUIC stream carries one TCP connection or controls one UDP association.
 //! Multi-byte integers are big endian. See `docs/protocol.md` for the wire format.
 
 use std::{
@@ -10,7 +10,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAGIC: [u8; 4] = *b"CDSR";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 /// A conservative common limit for IPv4 and IPv6 UDP payloads.
 pub const MAX_DATAGRAM_SIZE: usize = 65_507;
 
@@ -125,123 +125,5 @@ impl OpenStatus {
     pub async fn write<W: AsyncWrite + Unpin>(self, writer: &mut W) -> io::Result<()> {
         writer.write_u8(self as u8).await?;
         writer.flush().await
-    }
-}
-
-/// Stateful decoder: cancelling `recv` preserves any partially received frame.
-pub struct DatagramReader<R> {
-    inner: R,
-    header: [u8; 4],
-    header_read: usize,
-    payload: Vec<u8>,
-    payload_read: usize,
-    ended: bool,
-}
-
-impl<R: AsyncRead + Unpin> DatagramReader<R> {
-    pub fn new(inner: R) -> Self {
-        Self {
-            inner,
-            header: [0; 4],
-            header_read: 0,
-            payload: Vec::new(),
-            payload_read: 0,
-            ended: false,
-        }
-    }
-
-    /// `None` means clean EOF between frames. Truncated frames are errors.
-    pub async fn recv(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if self.ended {
-            return Ok(None);
-        }
-        while self.header_read < 4 {
-            let n = match self.inner.read(&mut self.header[self.header_read..]).await {
-                Ok(n) => n,
-                Err(error) => {
-                    self.ended = true;
-                    return Err(error);
-                }
-            };
-            if n == 0 {
-                self.ended = true;
-                return if self.header_read == 0 {
-                    Ok(None)
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated datagram header",
-                    ))
-                };
-            }
-            self.header_read += n;
-        }
-        let size = u32::from_be_bytes(self.header) as usize;
-        if size > MAX_DATAGRAM_SIZE {
-            self.ended = true;
-            return Err(invalid("datagram exceeds maximum size"));
-        }
-        self.payload.resize(size, 0);
-        while self.payload_read < size {
-            let n = match self
-                .inner
-                .read(&mut self.payload[self.payload_read..])
-                .await
-            {
-                Ok(n) => n,
-                Err(error) => {
-                    self.ended = true;
-                    return Err(error);
-                }
-            };
-            if n == 0 {
-                self.ended = true;
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated datagram payload",
-                ));
-            }
-            self.payload_read += n;
-        }
-        self.header_read = 0;
-        self.payload_read = 0;
-        Ok(Some(std::mem::take(&mut self.payload)))
-    }
-}
-
-/// A writer must be discarded if `send` is cancelled or fails after starting I/O.
-pub struct DatagramWriter<W> {
-    inner: W,
-    poisoned: bool,
-}
-
-impl<W: AsyncWrite + Unpin> DatagramWriter<W> {
-    pub fn new(inner: W) -> Self {
-        Self {
-            inner,
-            poisoned: false,
-        }
-    }
-
-    pub async fn send(&mut self, payload: &[u8]) -> io::Result<()> {
-        if self.poisoned {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "datagram writer has an incomplete frame",
-            ));
-        }
-        if payload.len() > MAX_DATAGRAM_SIZE {
-            return Err(invalid("datagram exceeds maximum size"));
-        }
-        self.poisoned = true;
-        self.inner.write_u32(payload.len() as u32).await?;
-        self.inner.write_all(payload).await?;
-        self.inner.flush().await?;
-        self.poisoned = false;
-        Ok(())
-    }
-
-    pub async fn shutdown(&mut self) -> io::Result<()> {
-        self.inner.shutdown().await
     }
 }

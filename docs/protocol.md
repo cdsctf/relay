@@ -1,6 +1,6 @@
-# cds-relay wire protocol v1
+# cds-relay QUIC wire protocol v2
 
-All multi-byte integers use big-endian encoding. One reliable, ordered, bidirectional byte stream carries one TCP connection or UDP association. The protocol does not multiplex targets, renegotiate an existing stream, or carry user authentication.
+All multi-byte integers use big-endian encoding. The only backend transport is QUIC with ALPN `cds-relay/2`. Each client-initiated bidirectional stream begins with a version 2 opening request selecting one numeric target and target-side transport protocol. QUIC authenticates the platform using mutual TLS; opening requests carry no individual user authentication.
 
 ## Opening a connection
 
@@ -9,7 +9,7 @@ Client → server:
 | Field | Bytes | Value |
 | --- | --- | --- |
 | magic | 4 | ASCII `CDSR` |
-| version | 1 | `1` |
+| version | 1 | `2` |
 | transport | 1 | `1` for TCP, `2` for UDP |
 | address family | 1 | `4` for IPv4, `6` for IPv6 |
 | address | 4 / 16 | IP address octets in network byte order |
@@ -37,21 +37,25 @@ All bytes after a successful response are raw TCP data. FIN propagates to the op
 
 ## UDP data
 
-Both directions repeatedly send the following frame:
+Each UDP association has a client-initiated bidirectional control stream. After its opening request and successful response, neither endpoint sends application bytes on that stream. FIN, RESET_STREAM, STOP_SENDING, unexpected control data, idle expiry, connection loss, or shutdown ends the association. There is no half-close or datagram-draining guarantee for UDP.
+
+Each QUIC DATAGRAM payload has this layout:
 
 | Field | Bytes | Meaning |
 | --- | --- | --- |
-| length | 4 | Payload length in `0..=65507` |
-| payload | length | One complete UDP datagram |
+| flow ID | 8 | Full QUIC stream ID of the UDP association, encoded as fixed-width `u64`, not a QUIC variable-length integer |
+| payload | Remaining | One complete UDP datagram, possibly empty |
 
-A zero length represents a valid empty datagram, not a heartbeat or error. Decoders validate the length before allocating payload memory. EOF between frames is a clean end; EOF inside a frame is a truncation error. An oversized frame terminates the tunnel. Oversized datagrams received from the target are dropped as whole packets instead of forwarding truncated contents.
+There is no length prefix, target address, sequence number, acknowledgement, or retransmission. The QUIC frame defines the packet boundary. A DATAGRAM shorter than eight bytes, larger than 65,515 bytes, or addressed to an unregistered flow is discarded. IDs are scoped to the QUIC connection and never reused within that connection. TCP stream IDs are not registered as UDP flows.
 
-Each association uses a separate UDP socket connected to one fixed target, with a distinct source port that remains stable for the association's lifetime. Only replies from that target are accepted. Addresses and ports are not repeated in each frame. The platform and client maintain their own mapping from WebTransport sessions and flows to relay associations outside this protocol.
+The client registers its flow before sending OPEN; the server registers before sending success. The client must wait for success before sending datagrams. Stream and DATAGRAM ordering are independent, so packets sent early can be dropped. Full receive queues drop new packets without delaying other flows. Closing the control stream removes the flow mapping; late packets are discarded.
 
-EOF on either direction of a UDP transport closes the entire association. UDP associations do not provide TCP-style half-close or reply-draining guarantees. Successful datagram transfers update the idle deadline; partial handshakes and partial frames do not extend an association's lifetime. Idle expiry remains active while waiting for target replies or tunnel writes.
+The outbound UDP payload must fit `min(65507, max_datagram_size - 8)` for the current QUIC connection and direction. Oversized platform packets produce a local error. Oversized target packets are dropped whole; no truncation, reliable-stream fallback, or application fragmentation is allowed. A valid eight-byte DATAGRAM carries an empty UDP packet.
 
-`DatagramReader` retains partial frame state, so a cancelled `recv` can be called again. An I/O error moves the reader to a terminal state. If `DatagramWriter::send` is cancelled or fails after starting I/O, the writer is poisoned to prevent another frame from corrupting the incomplete one. The caller must discard both halves of that association. Rejecting an oversized packet before writing does not poison the writer.
+Each association uses one connected target socket, preserving a stable source port and filtering unexpected target sources. Successful target sends and successfully queued target replies update the idle deadline. Dropped malformed/oversized/unknown packets do not. Closing the whole connection cancels and joins its target tasks; server shutdown performs the same cleanup for all connections.
+
+See the [QUIC guide](quic.md) for authentication, buffer limits, and credential lifecycle.
 
 ## Versioning
 
-This implementation supports only v1. Any incompatible change to the handshake or framing requires a new protocol version. Release the image, client crate, and protocol crate together. Servers must reject unsupported versions rather than guessing a client's format.
+Only opening version 2 is supported. Other versions are rejected with `UnsupportedVersion`; no transport fallback or downgrade is available. QUIC DATAGRAM support is required even for a connection initially used only for TCP. Any incompatible change requires a new protocol version. Release the image, client crate, and protocol crates together.

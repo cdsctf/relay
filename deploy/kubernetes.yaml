@@ -23,6 +23,7 @@ spec:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -31,7 +32,17 @@ spec:
           imagePullPolicy: Always
           args:
             - --listen
-            - 127.0.0.1:9527
+            - 0.0.0.0:9527
+            - --identity
+            - /run/secrets/relay/server.json
+          ports:
+            - name: quic
+              containerPort: 9527
+              protocol: UDP
+          volumeMounts:
+            - name: identity
+              mountPath: /run/secrets/relay
+              readOnly: true
           resources:
             requests:
               cpu: 25m
@@ -44,14 +55,29 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
-          readinessProbe:
-            exec:
-              command: [/usr/local/bin/cds-relay-server, --check]
-            periodSeconds: 5
-            timeoutSeconds: 2
-          livenessProbe:
-            exec:
-              command: [/usr/local/bin/cds-relay-server, --check]
-            initialDelaySeconds: 5
-            periodSeconds: 15
-            timeoutSeconds: 2
+      volumes:
+        - name: identity
+          secret:
+            secretName: cds-relay-identity
+            defaultMode: 0440
+            items:
+              - key: server.json
+                path: server.json
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cds-relay
+  labels:
+    app.kubernetes.io/name: cds-relay
+    app.kubernetes.io/instance: development
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cds-relay
+    app.kubernetes.io/instance: development
+  ports:
+    - name: quic
+      port: 9527
+      targetPort: quic
+      protocol: UDP

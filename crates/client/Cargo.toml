@@ -6,5 +6,8 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+cds-relay-quic.workspace = true
+quinn.workspace = true
+bytes.workspace = true
 cds-relay-protocol.workspace = true
 tokio.workspace = true
