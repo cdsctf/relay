@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cds-relay
+  labels:
+    app.kubernetes.io/name: cds-relay
+    app.kubernetes.io/instance: development
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cds-relay
+      app.kubernetes.io/instance: development
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cds-relay
+        app.kubernetes.io/instance: development
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 5
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: relay
+          image: ghcr.io/cdsctf/relay:dev
+          imagePullPolicy: Always
+          args:
+            - --listen
+            - 127.0.0.1:9527
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: "1"
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            exec:
+              command: [/usr/local/bin/cds-relay-server, --check]
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            exec:
+              command: [/usr/local/bin/cds-relay-server, --check]
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 2

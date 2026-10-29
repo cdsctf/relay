@@ -1,0 +1,22 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+cds-relay-protocol = { path = "crates/protocol" }
+cds-relay-client = { path = "crates/client" }
+tokio = { version = "1.53", features = ["io-util", "net", "rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+strip = true
